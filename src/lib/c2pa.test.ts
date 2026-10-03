@@ -4,6 +4,7 @@ import {
   processRemoteManifest, revalidateRemoteManifest,
   _setLocalModuleForTesting, _fetchSoftBindingAlgorithmsForTesting, _resetSoftBindingCacheForTesting,
 } from './c2pa'
+import { ASSET_ACCEPT, TEXT_ACCEPT, isTextFile } from './fileTypes'
 import type { ConformanceReport } from './types'
 
 // ── Shared crJSON factory ─────────────────────────────────────────────────────
@@ -152,6 +153,40 @@ describe('c2pa utilities', () => {
       expect(resolveMimeType(octet)).toBe('onnx')
       const noExt = new File([new Uint8Array([0])], 'blob', { type: 'application/octet-stream' })
       expect(resolveMimeType(noExt)).toBe('application/octet-stream')
+    })
+  })
+
+  // ── Text formats ────────────────────────────────────────────────────────────
+
+  describe('text formats', () => {
+    const file = (name: string, type: string) => new File(['hello'], name, { type })
+
+    it('maps text extensions to the format c2pa-rs registers, over the browser MIME', () => {
+      expect(resolveMimeType(file('notes.txt', 'text/plain'))).toBe('text/plain')
+      expect(resolveMimeType(file('page.HTM', ''))).toBe('text/html')
+      expect(resolveMimeType(file('README.md', ''))).toBe('text/markdown')
+      expect(resolveMimeType(file('config.yaml', 'application/x-yaml'))).toBe('application/yaml')
+      expect(resolveMimeType(file('Cargo.toml', ''))).toBe('application/toml')
+      expect(resolveMimeType(file('setup.ini', 'application/octet-stream'))).toBe('ini')
+      expect(resolveMimeType(file('app.js', 'application/x-javascript'))).toBe('text/javascript')
+      expect(resolveMimeType(file('script.py', 'text/x-python-script'))).toBe('text/x-python')
+      expect(resolveMimeType(file('feed.xml', 'text/xml'))).toBe('application/xml')
+      expect(resolveMimeType(file('data.tsv', 'text/tab-separated-values'))).toBe('text/tab-separated-values')
+    })
+
+    it('recognises text files by extension only', () => {
+      expect(isTextFile(file('notes.TXT', ''))).toBe(true)
+      expect(isTextFile(file('feed.atom', ''))).toBe(true)
+      expect(isTextFile(file('photo.jpg', 'image/jpeg'))).toBe(false)
+      expect(isTextFile(file('manifest.c2pa', ''))).toBe(false)
+      expect(isTextFile(file('txt', 'text/plain'))).toBe(false)
+    })
+
+    it('offers every text extension in the asset picker', () => {
+      for (const ext of ['.txt', '.html', '.md', '.yaml', '.toml', '.ini', '.xml', '.csv']) {
+        expect(ASSET_ACCEPT.split(',')).toContain(ext)
+      }
+      expect(TEXT_ACCEPT.split(',').every(e => ASSET_ACCEPT.split(',').includes(e))).toBe(true)
     })
   })
 
