@@ -666,7 +666,7 @@
     bind:this={fileInput}
     type="file"
     on:change={handleFileInput}
-    accept="image/*,video/*,audio/*,.pdf,.dng,.arw,.cr2,.cr3,.nef,.orf,.rw2"
+    accept="image/*,video/*,audio/*,.pdf,.dng,.arw,.cr2,.cr3,.nef,.orf,.rw2,.zip,.docx,.xlsx,.pptx,.ppsx,.ppsm,.odt,.ods,.odp,.epub,.oxps,.otf,.ttf,.safetensors,.onnx,.parquet,.keras,.heic,.heif,.heics,.heifs,.svg,.csv,.tsv,.txt,.html,.htm,.mid,.midi"
     class="hidden"
   />
 

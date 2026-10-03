@@ -353,8 +353,10 @@ export function resolveMimeType(file: File): string {
   const mapped = MIME_TYPE_MAP[file.type]
   if (mapped) return mapped
   if (file.type && file.type !== 'application/octet-stream') return file.type
-  const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
-  return EXTENSION_MIME_MAP[ext] ?? file.type
+  const ext = file.name.includes('.') ? file.name.split('.').pop()!.toLowerCase() : ''
+  // Browsers report no MIME type (or application/octet-stream) for many formats, e.g.
+  // .safetensors, .onnx and .parquet; c2pa-rs also accepts a file extension as the format.
+  return EXTENSION_MIME_MAP[ext] ?? (ext || file.type)
 }
 
 // ── Thumbnail enrichment ──────────────────────────────────────────────────────

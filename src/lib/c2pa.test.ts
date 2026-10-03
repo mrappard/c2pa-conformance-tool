@@ -144,6 +144,15 @@ describe('c2pa utilities', () => {
       expect(isSidecarFile(f)).toBe(false)
       expect(resolveMimeType(f)).toBe('image/jpeg')
     })
+
+    it('falls back to the extension when the browser reports no specific MIME', () => {
+      const empty = new File([new Uint8Array([0])], 'model.SafeTensors', { type: '' })
+      expect(resolveMimeType(empty)).toBe('safetensors')
+      const octet = new File([new Uint8Array([0])], 'model.onnx', { type: 'application/octet-stream' })
+      expect(resolveMimeType(octet)).toBe('onnx')
+      const noExt = new File([new Uint8Array([0])], 'blob', { type: 'application/octet-stream' })
+      expect(resolveMimeType(noExt)).toBe('application/octet-stream')
+    })
   })
 
   // ── processFile — basic ─────────────────────────────────────────────────────
