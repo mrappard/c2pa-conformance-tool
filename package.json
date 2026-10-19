@@ -7,6 +7,7 @@
     "dev": "node scripts/generate-version.js && vite",
     "build": "node scripts/generate-version.js && vite build",
     "build:local-wasm": "node scripts/build-local-wasm.mjs",
+    "update:cawg-trust": "node scripts/update-cawg-trust.mjs",
     "copy:profile-evaluator": "node scripts/copy-profile-evaluator.mjs",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",

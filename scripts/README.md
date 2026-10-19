@@ -30,6 +30,18 @@ Full CI build script used by Netlify. Builds the WASM module then runs the npm b
 
 ---
 
+## update-cawg-trust.mjs
+
+Refreshes the bundled Mozilla S/MIME root snapshot in `public/trust/cawg/` (`npm run update:cawg-trust`).
+
+### Why it's bundled:
+- The CAWG interim trust model names the Mozilla Root Store with the Email trust bit as a CAWG trust anchor list
+- CCADB serves that list without CORS headers, so the browser can't fetch it; the app loads this same-origin copy
+- `mozilla-smime-roots.json` records the source URL, fetch time, and certificate count shown in Test Certificates
+- The IPTC lists send CORS headers, so the browser fetches them live, and only when the user opts in
+
+---
+
 ## generate-version.js
 
 Generates `src/lib/version.ts` with git version information at build time.

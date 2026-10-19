@@ -433,12 +433,20 @@ mod eku_trust_config_tests {
     }
 
     /// Same shape `toLocalSettingsJson` (c2pa.ts) builds: `verify` plus a `trust` block
-    /// with our root as the trust anchor and, optionally, `trust_config`.
+    /// whose `anchors` array holds our root as a manifest-kind `TrustAnchor`, and,
+    /// optionally, `trust_config` both at the top level and on that anchor.
     fn settings_json(trust_config: Option<&str>) -> String {
-        let mut trust = serde_json::json!({ "trust_anchors": ROOT_CERT_PEM });
+        let mut anchor = serde_json::json!({
+            "trust_anchors": ROOT_CERT_PEM,
+            "trust_uri": "test-root",
+            "trust_kind": "manifest",
+        });
+        let mut trust = serde_json::json!({});
         if let Some(tc) = trust_config {
+            anchor["trust_config"] = serde_json::json!(tc);
             trust["trust_config"] = serde_json::json!(tc);
         }
+        trust["anchors"] = serde_json::json!([anchor]);
         serde_json::json!({
             "verify": { "verify_after_reading": true, "verify_trust": true },
             "trust": trust,
@@ -471,8 +479,31 @@ mod eku_trust_config_tests {
         );
     }
 
+    /// The per-anchor `trust_config` alone is not enough: c2pa-rs's signer trust check
+    /// reads only the top-level `trust.trust_config` for EKUs, so toLocalSettingsJson
+    /// must keep sending both.
+    #[test]
+    fn per_anchor_trust_config_alone_does_not_accept_a_c2pa_only_eku_cert() {
+        let signed_bytes = sign_test_asset();
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&settings_json(Some(DEFAULT_TRUST_CONFIG))).unwrap();
+        settings["trust"].as_object_mut().unwrap().remove("trust_config");
+
+        let crjson = pollster::block_on(read_manifest_store(
+            signed_bytes,
+            "image/jpeg".to_string(),
+            Some(settings.to_string()),
+        ))
+        .unwrap_or_else(|e| panic!("read_manifest_store failed: {e:?}"));
+
+        assert!(
+            !crjson.contains("signingCredential.trusted"),
+            "expected per-anchor trust_config alone to be insufficient, but got: {crjson}"
+        );
+    }
+
     /// Proves the test above is meaningful: without trust_config, the identical
-    /// cert/asset — whose issuing root IS in trust_anchors — is still rejected purely
+    /// cert/asset — whose issuing root IS in trust.anchors — is still rejected purely
     /// on EKU grounds. This is the exact bug #59 reported and PR #60 fixed.
     #[test]
     fn without_trust_config_the_same_cert_is_rejected_on_eku_grounds() {
@@ -500,5 +531,183 @@ mod eku_trust_config_tests {
             crjson.contains("signingCredential.untrusted"),
             "expected signingCredential.untrusted without trust_config, but got: {crjson}"
         );
+    }
+}
+
+/// CAWG identity trust as configured by `toLocalSettingsJson` (c2pa.ts): a
+/// `trust_kind: "cawg"` `TrustAnchor` carrying session-supplied X.509 roots and/or
+/// trusted ICA issuer DIDs. Uses c2pa-rs's own signed CAWG fixtures, read through the
+/// real `read_manifest_store` entry point, and checks the statuses scoped to the
+/// `cawg.identity` assertion — which is what src/lib/cawg.ts derives its state from.
+#[cfg(test)]
+mod cawg_trust_tests {
+    use super::*;
+
+    // Manifest signed with c2pa-rs's test certs, carrying an X.509 `cawg.identity`
+    // assertion whose certificate chains to the same test root bundle.
+    const CAWG_X509_JPEG: &[u8] = include_bytes!("../../c2pa-rs/sdk/tests/fixtures/C_with_CAWG_data.jpg");
+    const TEST_ROOT_BUNDLE_PEM: &str =
+        include_str!("../../c2pa-rs/sdk/tests/fixtures/certs/trust/test_cert_root_bundle.pem");
+
+    // Manifest carrying an identity-claims-aggregation `cawg.identity` assertion.
+    const CAWG_ICA_JPEG: &[u8] = include_bytes!(
+        "../../c2pa-rs/sdk/src/identity/tests/fixtures/claim_aggregation/ica_validation/success.jpg"
+    );
+    const ICA_ISSUER_DID: &str = "did:jwk:eyJhbGciOiJFZERTQSIsImt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoiTXA1LTBlODNuTmdRaGRoQlc4UnNoa2p5OTBzYTFBOUpJemtJdGNEcUN1SSJ9";
+
+    /// Settings with no C2PA anchors of interest and, optionally, a CAWG anchor.
+    fn settings_json(cawg_anchor: Option<serde_json::Value>) -> String {
+        let mut anchors = vec![];
+        if let Some(a) = cawg_anchor {
+            anchors.push(a);
+        }
+        serde_json::json!({
+            "verify": { "verify_after_reading": true, "verify_trust": true, "remote_manifest_fetch": false },
+            "trust": { "anchors": anchors },
+        })
+        .to_string()
+    }
+
+    fn cawg_anchor(trust_anchors: &str, trusted_ica_issuers: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "trust_anchors": trust_anchors,
+            "trust_uri": "session:cawg-identity-trust",
+            "trust_kind": "cawg",
+            "trusted_ica_issuers": trusted_ica_issuers,
+        })
+    }
+
+    /// Codes in crJSON whose `url` points at a `cawg.identity` assertion.
+    fn identity_codes(crjson: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(crjson).expect("crJSON should parse");
+        let mut codes = vec![];
+        let mut visit = |list: &serde_json::Value| {
+            for s in list.as_array().into_iter().flatten() {
+                let url = s["url"].as_str().unwrap_or("");
+                if url.ends_with("/cawg.identity") {
+                    codes.push(s["code"].as_str().unwrap_or("").to_string());
+                }
+            }
+        };
+        for m in v["manifests"].as_array().into_iter().flatten() {
+            for bucket in ["success", "informational", "failure"] {
+                visit(&m["validationResults"][bucket]);
+            }
+        }
+        for bucket in ["success", "informational", "failure"] {
+            visit(&v["validationResults"]["activeManifest"][bucket]);
+        }
+        codes
+    }
+
+    fn read(bytes: &[u8], settings: String) -> String {
+        pollster::block_on(read_manifest_store(bytes.to_vec(), "image/jpeg".to_string(), Some(settings)))
+            .unwrap_or_else(|e| panic!("read_manifest_store failed: {e:?}"))
+    }
+
+    #[test]
+    fn x509_identity_is_untrusted_without_a_cawg_anchor() {
+        let codes = identity_codes(&read(CAWG_X509_JPEG, settings_json(None)));
+        assert!(
+            !codes.iter().any(|c| c == "cawg.x509.credential.trusted"),
+            "did not expect a trusted CAWG identity without a CAWG anchor: {codes:?}"
+        );
+        assert!(
+            codes.iter().any(|c| c == "cawg.x509.credential.untrusted" || c == "signingCredential.untrusted"),
+            "expected an untrusted CAWG identity without a CAWG anchor: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn x509_identity_is_trusted_once_its_cawg_anchor_is_configured() {
+        let settings = settings_json(Some(cawg_anchor(TEST_ROOT_BUNDLE_PEM, &[])));
+        let codes = identity_codes(&read(CAWG_X509_JPEG, settings));
+        assert!(
+            codes.iter().any(|c| c == "cawg.x509.credential.trusted"),
+            "expected cawg.x509.credential.trusted with the CAWG anchor configured: {codes:?}"
+        );
+        assert!(
+            !codes.iter().any(|c| c == "cawg.x509.credential.untrusted" || c == "signingCredential.untrusted"),
+            "did not expect an untrusted CAWG identity with the anchor configured: {codes:?}"
+        );
+    }
+
+    /// Documents why c2pa.ts only keeps `cawg.identity`-scoped statuses from its CAWG
+    /// read: c2pa-rs adds every anchor to the C2PA signer trust policy regardless of
+    /// `trust_kind`, so a CAWG-only anchor also makes the claim signer "trusted".
+    /// If this starts failing, c2pa-rs scoped CAWG anchors to identities and the
+    /// separate CAWG read in runTrustValidationFlow could be folded into step 1.
+    #[test]
+    fn cawg_anchor_also_trusts_the_c2pa_claim_signer() {
+        let settings = settings_json(Some(cawg_anchor(TEST_ROOT_BUNDLE_PEM, &[])));
+        let crjson = read(CAWG_X509_JPEG, settings);
+        let v: serde_json::Value = serde_json::from_str(&crjson).unwrap();
+        let signer_trusted_via_cawg = v["manifests"].as_array().into_iter().flatten().any(|m| {
+            m["validationResults"]["success"].as_array().into_iter().flatten().any(|s| {
+                s["code"] == "signingCredential.trusted"
+                    && s["url"].as_str().unwrap_or("").ends_with("/c2pa.signature")
+                    && s["explanation"].as_str().unwrap_or("").contains("session:cawg-identity-trust")
+            })
+        });
+        assert!(signer_trusted_via_cawg, "expected the CAWG anchor to leak into C2PA signer trust: {crjson}");
+    }
+
+    // The Mozilla S/MIME snapshot the app bundles, and a copy of the IPTC end-entity
+    // list (trust.iptc.org/end-entity-list.pem, fetched 2026-10-19).
+    const MOZILLA_SMIME_ROOTS_PEM: &str =
+        include_str!("../../public/trust/cawg/mozilla-smime-roots.pem");
+    const IPTC_END_ENTITY_PEM: &str = include_str!("../tests/fixtures/cawg/iptc-end-entity-list.pem");
+
+    /// The opt-in CAWG interim trust lists, shaped as toLocalSettingsJson sends them:
+    /// Mozilla roots as one CAWG anchor, and the IPTC lists as another whose anchor
+    /// list is empty (as trust.iptc.org serves it today) but whose end-entity list
+    /// rides on `allowed_list`.
+    #[test]
+    fn cawg_interim_trust_lists_are_accepted_by_c2pa_rs() {
+        let mozilla = serde_json::json!({
+            "trust_anchors": MOZILLA_SMIME_ROOTS_PEM,
+            "trust_uri": "https://ccadb.my.salesforce-sites.com/mozilla/IncludedRootsPEMTxt?TrustBitsInclude=Email",
+            "trust_kind": "cawg",
+        });
+        let iptc = serde_json::json!({
+            "trust_anchors": "",
+            "trust_uri": "https://trust.iptc.org/anchor-list.pem",
+            "trust_kind": "cawg",
+            "allowed_list": IPTC_END_ENTITY_PEM,
+        });
+        let settings = serde_json::json!({
+            "verify": { "verify_after_reading": true, "verify_trust": true, "remote_manifest_fetch": false },
+            "trust": { "anchors": [mozilla, iptc] },
+        })
+        .to_string();
+
+        // read() panics if c2pa-rs rejects the settings.
+        let codes = identity_codes(&read(CAWG_X509_JPEG, settings));
+        // c2pa-rs's test identity cert chains to neither list.
+        assert!(
+            !codes.iter().any(|c| c == "cawg.x509.credential.trusted"),
+            "did not expect the test identity to be trusted by the public lists: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn ica_identity_is_untrusted_without_a_trusted_issuer() {
+        let codes = identity_codes(&read(CAWG_ICA_JPEG, settings_json(None)));
+        assert!(
+            codes.iter().any(|c| c == "cawg.ica.untrusted_issuer"),
+            "expected cawg.ica.untrusted_issuer with no ICA issuers configured: {codes:?}"
+        );
+        assert!(!codes.iter().any(|c| c == "cawg.ica.credential_valid"), "{codes:?}");
+    }
+
+    #[test]
+    fn ica_identity_is_trusted_once_its_issuer_did_is_configured() {
+        let settings = settings_json(Some(cawg_anchor("", &[ICA_ISSUER_DID])));
+        let codes = identity_codes(&read(CAWG_ICA_JPEG, settings));
+        assert!(
+            codes.iter().any(|c| c == "cawg.ica.credential_valid"),
+            "expected cawg.ica.credential_valid with the issuer DID configured: {codes:?}"
+        );
+        assert!(!codes.iter().any(|c| c == "cawg.ica.untrusted_issuer"), "{codes:?}");
     }
 }

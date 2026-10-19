@@ -2,17 +2,32 @@
   import { createEventDispatcher } from 'svelte'
   import { X509Certificate } from '@peculiar/x509'
   import { CERTIFICATE_OID, EXTENDED_KEY_USAGE_OID } from './constants'
+  import { loadCawgPublicLists, type CawgTrustConfig } from './c2pa'
 
   export let testCertificates: string[] = []
   export let testModeEnabled = false
   export let testRootLoaded = false
+  // Session-only CAWG identity trust; applied to cawg.identity credentials only
+  export let cawgAnchors: string[] = []
+  export let trustedIcaIssuers: string[] = []
+  // Opt-in: CAWG interim trust lists (bundled Mozilla S/MIME roots + live IPTC fetch)
+  export let cawgPublicLists = false
 
   const dispatch = createEventDispatcher<{
     certificatesUpdated: string[]
     testModeChanged: { enabled: boolean; rootLoaded: boolean }
+    cawgTrustUpdated: CawgTrustConfig
   }>()
 
   let fileInput: HTMLInputElement
+  let cawgFileInput: HTMLInputElement
+  let icaIssuerInput = ''
+  let icaIssuerError: string | null = null
+  let publicListsStatus: string | null = null
+  let publicListsError: string | null = null
+  let publicListsLoading = false
+
+  const countCerts = (pem: string) => (pem.match(/-----BEGIN CERTIFICATE-----/g) ?? []).length
   let expandedCerts: Set<number> = new Set()
 
   interface CertificateInfo {
@@ -257,6 +272,86 @@
     fileInput.click()
   }
 
+  function dispatchCawgTrust() {
+    dispatch('cawgTrustUpdated', { anchors: cawgAnchors, trustedIcaIssuers, publicLists: cawgPublicLists })
+  }
+
+  async function describePublicLists() {
+    publicListsLoading = true
+    publicListsError = null
+    try {
+      const lists = await loadCawgPublicLists()
+      const snapshot = lists.mozillaSnapshotDate
+        ? ` (snapshot ${new Date(lists.mozillaSnapshotDate).toLocaleDateString()})`
+        : ''
+      publicListsStatus =
+        `${countCerts(lists.mozillaSmimeRoots)} Mozilla S/MIME roots${snapshot}, ` +
+        `${countCerts(lists.iptcAnchors)} IPTC anchors, ${countCerts(lists.iptcEndEntities)} IPTC end-entity certificates`
+    } catch (err) {
+      publicListsStatus = null
+      publicListsError = `Could not load the lists: ${err instanceof Error ? err.message : String(err)}`
+    } finally {
+      publicListsLoading = false
+    }
+  }
+
+  async function togglePublicLists(event: Event) {
+    cawgPublicLists = (event.target as HTMLInputElement).checked
+    if (cawgPublicLists) await describePublicLists()
+    dispatchCawgTrust()
+  }
+
+  // Show list counts when returning to this page with the lists already enabled.
+  if (cawgPublicLists) describePublicLists()
+
+  function handleCawgFileSelect(event: Event) {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const content = e.target?.result as string
+      if (content && content.includes('BEGIN CERTIFICATE')) {
+        cawgAnchors = [...cawgAnchors, content]
+        dispatchCawgTrust()
+        console.log('✅ CAWG trust anchor added:', file.name)
+      } else {
+        alert('Invalid certificate file. Please select a PEM-encoded certificate.')
+      }
+    }
+    reader.onerror = () => {
+      console.error('Failed to read CAWG anchor file:', reader.error)
+      alert('Failed to read certificate file. Please try again.')
+    }
+    reader.readAsText(file)
+    input.value = ''
+  }
+
+  function removeCawgAnchor(index: number) {
+    cawgAnchors = cawgAnchors.filter((_, i) => i !== index)
+    dispatchCawgTrust()
+  }
+
+  function addIcaIssuer() {
+    // c2pa-rs compares the credential issuer, minus any #fragment, by exact match.
+    const did = icaIssuerInput.trim().split('#')[0]
+    if (!/^did:[a-z0-9]+:\S+$/.test(did)) {
+      icaIssuerError = 'Enter a DID, for example did:web:example.com'
+      return
+    }
+    icaIssuerError = null
+    icaIssuerInput = ''
+    if (trustedIcaIssuers.includes(did)) return
+    trustedIcaIssuers = [...trustedIcaIssuers, did]
+    dispatchCawgTrust()
+  }
+
+  function removeIcaIssuer(index: number) {
+    trustedIcaIssuers = trustedIcaIssuers.filter((_, i) => i !== index)
+    dispatchCawgTrust()
+  }
+
   // Embedded C2PA test root certificate (avoids network fetch issues)
   const TEST_ROOT_CERT_PEM = `-----BEGIN CERTIFICATE-----
 MIICBTCCAaygAwIBAgIUUtIyu93JJmVhLMyrf/bsIavWFNAwCgYIKoZIzj0EAwIw
@@ -473,8 +568,105 @@ MCZvLxXCtwIgCxkR0Gbdwef8k0bf1tC3dz+4NDe0S8wdCx5ZgeRPkq4=
         {/each}
       </div>
     {/if}
+
+    <!-- CAWG identity trust (session-only) -->
+    <div class="p-4 bg-white dark:bg-gray-800 border-2 border-gray-200 dark:border-gray-700 rounded-2xl space-y-4">
+      <div>
+        <h4 class="font-bold text-[#1e293b] dark:text-white text-lg mb-1">CAWG Identity Trust</h4>
+        <p class="text-xs text-gray-600 dark:text-gray-400">
+          Trust lists, anchors, and identity claims aggregation (ICA) issuers for evaluating CAWG identity assertions. Settings are session-only and never used to trust the C2PA signer. Results are flagged when anchors or issuers you add change an identity's verdict.
+        </p>
+      </div>
+
+      <div class="space-y-1">
+        <label class="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            class="mt-1 rounded"
+            checked={cawgPublicLists}
+            on:change={togglePublicLists}
+            aria-describedby="cawg-public-lists-desc"
+          />
+          <span>
+            <span class="text-sm font-semibold text-[#1e293b] dark:text-gray-100">Use CAWG interim trust lists</span>
+            <span id="cawg-public-lists-desc" class="block text-xs text-gray-600 dark:text-gray-400">
+              Mozilla root store with the Email trust bit (bundled snapshot) and the IPTC Origin Verified News Publishers lists. Turning this on fetches the IPTC lists from trust.iptc.org, which can see your IP address.
+            </span>
+          </span>
+        </label>
+        {#if cawgPublicLists}
+          <p class="text-xs pl-7 {publicListsError ? 'text-red-700 dark:text-red-300' : 'text-gray-600 dark:text-gray-400'}" role="status">
+            {publicListsLoading ? 'Loading lists…' : publicListsError ?? publicListsStatus ?? ''}
+          </p>
+        {/if}
+      </div>
+
+      <div class="space-y-2">
+        <div class="flex items-center justify-between gap-4">
+          <span class="text-sm font-semibold text-[#1e293b] dark:text-gray-100">X.509 trust anchors</span>
+          <button class="btn btn-secondary whitespace-nowrap" on:click={() => cawgFileInput.click()}>
+            <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12 5l0 14" /><path d="M5 12l14 0" /></svg>
+            Add CAWG Anchor
+          </button>
+        </div>
+        {#each cawgAnchors as anchor, index}
+          <div class="flex items-center justify-between gap-2 px-4 py-2 text-sm rounded-lg border border-gray-200 dark:border-gray-700">
+            <span class="text-[#1e293b] dark:text-gray-100 truncate">{extractSubjectFromPEM(anchor)}</span>
+            <button
+              class="flex items-center justify-center w-8 h-8 text-gray-400 dark:text-gray-500 hover:text-white hover:bg-red-600 dark:hover:bg-red-700 rounded-lg transition-all flex-shrink-0"
+              on:click={() => removeCawgAnchor(index)}
+              title="Remove CAWG anchor"
+              aria-label="Remove CAWG anchor {extractSubjectFromPEM(anchor)}"
+            >
+              <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M18 6l-12 12" /><path d="M6 6l12 12" /></svg>
+            </button>
+          </div>
+        {/each}
+      </div>
+
+      <div class="space-y-2">
+        <label for="ica-issuer-input" class="text-sm font-semibold text-[#1e293b] dark:text-gray-100">Trusted ICA issuer DIDs</label>
+        <form class="flex gap-2" on:submit|preventDefault={addIcaIssuer}>
+          <input
+            id="ica-issuer-input"
+            class="flex-1 min-w-0 px-3 py-2 text-sm font-mono rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-[#1e293b] dark:text-gray-100"
+            placeholder="did:web:example.com"
+            autocomplete="off"
+            spellcheck="false"
+            bind:value={icaIssuerInput}
+            aria-invalid={icaIssuerError ? 'true' : undefined}
+            aria-describedby={icaIssuerError ? 'ica-issuer-error' : undefined}
+          />
+          <button type="submit" class="btn btn-secondary whitespace-nowrap">Add Issuer</button>
+        </form>
+        {#if icaIssuerError}
+          <p id="ica-issuer-error" class="text-xs text-red-700 dark:text-red-300">{icaIssuerError}</p>
+        {/if}
+        {#each trustedIcaIssuers as did, index}
+          <div class="flex items-center justify-between gap-2 px-4 py-2 text-sm rounded-lg border border-gray-200 dark:border-gray-700">
+            <span class="font-mono text-[#1e293b] dark:text-gray-100 break-all">{did}</span>
+            <button
+              class="flex items-center justify-center w-8 h-8 text-gray-400 dark:text-gray-500 hover:text-white hover:bg-red-600 dark:hover:bg-red-700 rounded-lg transition-all flex-shrink-0"
+              on:click={() => removeIcaIssuer(index)}
+              title="Remove issuer"
+              aria-label="Remove issuer {did}"
+            >
+              <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M18 6l-12 12" /><path d="M6 6l12 12" /></svg>
+            </button>
+          </div>
+        {/each}
+      </div>
+    </div>
   </div>
 </div>
+
+<input
+  bind:this={cawgFileInput}
+  type="file"
+  accept=".pem,.crt,.cer"
+  on:change={handleCawgFileSelect}
+  class="hidden"
+/>
 
 <input
   bind:this={fileInput}

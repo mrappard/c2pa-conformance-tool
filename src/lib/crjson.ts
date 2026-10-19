@@ -209,6 +209,54 @@ function excludeAssertionScoped(status: CrJsonActiveManifestStatus): CrJsonActiv
   }
 }
 
+const STATUS_BUCKETS = ['success', 'informational', 'failure'] as const
+
+/** `base`'s statuses, except that CAWG-identity-scoped ones are taken from `source`. */
+function withIdentityScopedFrom<T extends CrJsonActiveManifestStatus>(
+  base: T | undefined,
+  source: CrJsonActiveManifestStatus | undefined,
+): T | undefined {
+  if (!base && !source) return base
+  const out = { ...(base ?? {}) } as T
+  for (const key of STATUS_BUCKETS) {
+    const kept = base?.[key]?.filter((s) => !isAssertionScopedStatus(s)) ?? []
+    const scoped = source?.[key]?.filter(isAssertionScopedStatus) ?? []
+    if (base?.[key] || scoped.length) out[key] = [...kept, ...scoped]
+  }
+  return out
+}
+
+/**
+ * Returns `base` with every CAWG-identity-scoped status (see `isAssertionScopedStatus`)
+ * replaced by the ones `source` reports for the same location; all other statuses
+ * come from `base` unchanged. Used to take only the identity verdicts from a read
+ * made with extra CAWG trust.
+ */
+export function withCawgIdentityStatusesFrom(base: CrJson, source: CrJson): CrJson {
+  const sourceManifests = new Map(source.manifests?.map((m) => [m.label, m]) ?? [])
+  const baseVr = base.validationResults
+  const sourceVr = source.validationResults
+
+  const validationResults = baseVr || sourceVr
+    ? {
+        ...withIdentityScopedFrom(baseVr, sourceVr),
+        ...(baseVr?.activeManifest || sourceVr?.activeManifest
+          ? { activeManifest: withIdentityScopedFrom(baseVr?.activeManifest, sourceVr?.activeManifest) }
+          : {}),
+      }
+    : undefined
+
+  return {
+    ...base,
+    manifests: base.manifests?.map((m) => {
+      const src = sourceManifests.get(m.label)
+      if (!m.validationResults && !src?.validationResults) return m
+      return { ...m, validationResults: withIdentityScopedFrom(m.validationResults, src?.validationResults) }
+    }),
+    ...(validationResults ? { validationResults } : {}),
+  }
+}
+
 function mergeStatusLists(
   ...lists: Array<CrJsonValidationStatus[] | undefined>
 ): CrJsonValidationStatus[] {
