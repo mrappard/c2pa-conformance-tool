@@ -9,7 +9,7 @@
   import FileUpload from './lib/FileUpload.svelte'
   import ReportViewer from './lib/ReportViewer.svelte'
   import CertificateManager from './lib/CertificateManager.svelte'
-  import { processFile, processSidecarWithAsset, isSidecarFile, processRemoteManifest, revalidateRemoteManifest } from './lib/c2pa'
+  import { processFile, processSidecarWithAsset, isSidecarFile, processRemoteManifest, revalidateRemoteManifest, setCawgTrust, type CawgTrustConfig } from './lib/c2pa'
   import { testTrustListFetch } from './lib/trustListTest'
   import type { ConformanceReport } from './lib/types'
 
@@ -28,6 +28,9 @@
   let processing = false
   let globalDragOver = false
   let testCertificates: string[] = []
+  let cawgAnchors: string[] = []          // session-only CAWG X.509 identity trust anchors
+  let trustedIcaIssuers: string[] = []    // session-only trusted ICA issuer DIDs
+  let cawgPublicLists = false             // opt-in: CAWG interim trust lists (Mozilla S/MIME + IPTC)
   let usedTestCertificates = false
   let selectedFile: File | null = null
   let sidecarFile: File | null = null       // companion file when we processed a sidecar+asset pair
@@ -356,6 +359,14 @@
     }
   }
 
+  async function handleCawgTrustUpdated(event: CustomEvent<CawgTrustConfig>) {
+    setCawgTrust(event.detail)
+    if (selectedFile && report) {
+      console.log('🔄 Reprocessing file with updated CAWG trust...')
+      await reprocessCurrentFile()
+    }
+  }
+
   function handleGlobalDragEnter(event: DragEvent) {
     event.preventDefault()
     event.stopPropagation()
@@ -565,6 +576,10 @@
         bind:testRootLoaded={testRootLoaded}
         on:certificatesUpdated={handleCertificatesUpdated}
         on:testModeChanged={handleTestModeChanged}
+        bind:cawgAnchors={cawgAnchors}
+        bind:trustedIcaIssuers={trustedIcaIssuers}
+        bind:cawgPublicLists={cawgPublicLists}
+        on:cawgTrustUpdated={handleCawgTrustUpdated}
       />
     </div>
 

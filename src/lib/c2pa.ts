@@ -1,12 +1,55 @@
 import { VERSION_INFO } from './version'
 import type { ConformanceReport, IcaOcspInfo } from './types'
 import { VALIDATION_STATUS } from './constants'
-import { isCrJson, legacyToCrJson, getActiveManifestValidationStatus, type CrJson } from './crjson'
+import {
+  isCrJson, legacyToCrJson, getActiveManifestValidationStatus, withCawgIdentityStatusesFrom, type CrJson,
+} from './crjson'
+import { getCawgIdentities } from './cawg'
+
+// One named trust list, mapped to a c2pa-rs `TrustAnchor` entry in `trust.anchors`.
+type TrustListSettings = {
+  /** PEM bundle of root certificates */
+  pem: string
+  /** Reported by c2pa-rs as the trust list a signer was found in */
+  uri: string
+  kind?: 'manifest' | 'tsa' | 'cawg'
+  /** PEM bundle of explicitly allowed end-entity certificates */
+  allowedList?: string
+  /** CAWG lists only: exact-match DIDs of trusted ICA credential issuers */
+  trustedIcaIssuers?: string[]
+}
+
+/**
+ * Session-only CAWG identity trust, configured in CertificateManager and kept in
+ * memory only. Used to evaluate `cawg.identity` credentials: X.509 identity
+ * certificates against `anchors`, identity claims aggregation (ICA) credentials
+ * against `trustedIcaIssuers` (exact-match DIDs).
+ */
+export type CawgTrustConfig = {
+  /** PEM root certificates trusted for CAWG X.509 identity credentials */
+  anchors?: string[]
+  /** DIDs of trusted ICA credential issuers */
+  trustedIcaIssuers?: string[]
+  /**
+   * Opt in to the CAWG interim trust lists: the bundled Mozilla S/MIME root
+   * snapshot, plus the IPTC lists fetched live from trust.iptc.org.
+   */
+  publicLists?: boolean
+}
+
+/** CAWG interim trust lists (CAWG identity assertion spec §8.2.4.1), as loaded. */
+export type CawgPublicLists = {
+  mozillaSmimeRoots: string
+  /** When the bundled Mozilla snapshot was taken, if recorded */
+  mozillaSnapshotDate?: string
+  iptcAnchors: string
+  iptcEndEntities: string
+}
 
 // Trust/verify settings passed to the local WASM read functions.
 type Settings = {
   verify?: { verifyAfterReading?: boolean; verifyTrust?: boolean }
-  trust?: { trustAnchors?: string; allowedList?: string }
+  trust?: { lists?: TrustListSettings[] }
   softBindingAlgorithms?: string[]
 }
 
@@ -44,6 +87,8 @@ type ExtractedCrJsonResult = {
   crJson: CrJson
   usedITL: boolean
   usedTestCerts: boolean
+  usedCawgTrust: boolean
+  usedCawgPublicLists: boolean
   icaOcsp?: Record<string, IcaOcspInfo>
 }
 
@@ -51,8 +96,12 @@ const importModule = new Function('modulePath', 'return import(modulePath)') as 
 
 type ITL = { allowed: string; anchors: string }
 
+type MainTrustLists = { c2pa: string; tsa: string }
+
 let c2paInstance: C2paInstance | null = null
-let mainTrustListPem: string | null = null
+let mainTrustLists: MainTrustLists | null = null
+let cawgTrust: CawgTrustConfig = {}
+let cawgPublicLists: CawgPublicLists | null = null
 let itl: ITL | null = null
 let softBindingAlgorithms: string[] | null = null
 
@@ -72,6 +121,21 @@ const base = typeof import.meta.env?.BASE_URL === 'string' ? import.meta.env.BAS
 const ITL_ALLOWED_URL = `${base}trust/allowed.pem`   // leaf certificates
 const ITL_ANCHORS_URL = `${base}trust/anchors.pem`   // root certificates
 
+// CAWG interim trust lists, used only when the user opts in. CCADB serves the
+// Mozilla list without CORS headers, so a same-origin snapshot is bundled (see
+// scripts/update-cawg-trust.mjs); the IPTC lists allow cross-origin fetches and
+// are fetched live, which reveals the user's IP address to trust.iptc.org.
+const MOZILLA_SMIME_SOURCE_URL = 'https://ccadb.my.salesforce-sites.com/mozilla/IncludedRootsPEMTxt?TrustBitsInclude=Email'
+const MOZILLA_SMIME_SNAPSHOT_URL = `${base}trust/cawg/mozilla-smime-roots.pem`
+const MOZILLA_SMIME_SNAPSHOT_META_URL = `${base}trust/cawg/mozilla-smime-roots.json`
+const IPTC_ANCHOR_LIST_URL = 'https://trust.iptc.org/anchor-list.pem'
+const IPTC_END_ENTITY_LIST_URL = 'https://trust.iptc.org/end-entity-list.pem'
+
+// Trust list URIs for lists that aren't fetched from a URL of their own. c2pa-rs
+// reports the URI in `signingCredential.trusted` explanations.
+const TEST_CERTS_TRUST_URI = 'session:test-certificates'
+const CAWG_SESSION_TRUST_URI = 'session:cawg-identity-trust'
+
 // c2pa-rs clears its built-in EKU allow-list when constructing a Store from
 // custom context settings. Restore the SDK's standard C2PA EKUs whenever this
 // app supplies custom trust anchors.
@@ -83,6 +147,42 @@ const DEFAULT_TRUST_CONFIG = [
   '1.3.6.1.4.1.311.76.59.1.9', // Microsoft C2PA signing
   '1.3.6.1.4.1.62558.2.1',     // C2PA claim signing
 ].join('\n')
+
+function hasSessionCawgTrust(cawg?: CawgTrustConfig): boolean {
+  return !!(cawg?.anchors?.length || cawg?.trustedIcaIssuers?.length)
+}
+
+/**
+ * Builds c2pa-rs `trust` settings as a `trust.anchors: TrustAnchor[]` array (the
+ * deprecated `trust.trust_anchors` / `user_anchors` strings are removed in c2pa-rs
+ * 0.92). Each trust list becomes its own anchor so its URI is reported back.
+ *
+ * c2pa-rs adds every anchor to the C2PA signer trust policy regardless of
+ * `trust_kind`, so a CAWG anchor here can also make a C2PA claim signer chaining
+ * to it look trusted. Only pass `cawg` for reads whose `cawg.identity`-scoped
+ * statuses are the only ones kept (see runTrustValidationFlow).
+ */
+function toLocalTrustSettings(trust?: Settings['trust']) {
+  const anchors: Record<string, unknown>[] = (trust?.lists ?? []).map((list) => {
+    const kind = list.kind ?? 'manifest'
+    return {
+      trust_anchors: list.pem,
+      trust_uri: list.uri,
+      trust_kind: kind,
+      // A CAWG anchor's trust_config replaces c2pa-rs's CAWG EKU policy, so leave it unset.
+      ...(kind !== 'cawg' ? { trust_config: DEFAULT_TRUST_CONFIG } : {}),
+      // Skip an allowed_list with nothing in it (the IPTC lists can be served empty).
+      ...(list.allowedList?.includes('BEGIN CERTIFICATE') ? { allowed_list: list.allowedList } : {}),
+      ...(list.trustedIcaIssuers ? { trusted_ica_issuers: list.trustedIcaIssuers } : {}),
+    }
+  })
+
+  if (anchors.length === 0) return undefined
+
+  // The top-level trust_config is what the signer trust check itself consults for
+  // EKUs; the per-anchor copy only overrides the certificate profile check.
+  return { trust_config: DEFAULT_TRUST_CONFIG, anchors }
+}
 
 function toLocalSettingsJson(settings?: Settings): string {
   const localSettings = {
@@ -101,13 +201,7 @@ function toLocalSettingsJson(settings?: Settings): string {
       // responders don't serve CORS headers and can't be fetched from the browser directly.
       ocsp_fetch: true,
     },
-    trust: (settings?.trust?.trustAnchors || settings?.trust?.allowedList)
-      ? {
-          ...(settings?.trust?.trustAnchors ? { trust_anchors: settings.trust.trustAnchors } : {}),
-          ...(settings?.trust?.allowedList ? { allowed_list: settings.trust.allowedList } : {}),
-          trust_config: DEFAULT_TRUST_CONFIG,
-        }
-      : undefined,
+    trust: toLocalTrustSettings(settings?.trust),
     ...(settings?.softBindingAlgorithms?.length
       ? { soft_binding: { soft_binding_algorithms: settings.softBindingAlgorithms } }
       : {}),
@@ -279,11 +373,100 @@ async function initC2pa(): Promise<C2paInstance> {
   return c2paInstance
 }
 
+/**
+ * Set the session-only CAWG identity trust used by later validations. Kept in
+ * memory only; reports flag `usedCawgTrust` when it changed an identity's verdict.
+ */
+export function setCawgTrust(config: CawgTrustConfig): void {
+  cawgTrust = {
+    anchors: [...(config.anchors ?? [])],
+    trustedIcaIssuers: [...(config.trustedIcaIssuers ?? [])],
+    publicLists: config.publicLists === true,
+  }
+}
+
+/**
+ * Load the CAWG interim trust lists (cached once loaded). Fetches the IPTC lists
+ * from trust.iptc.org, so only call this after the user has opted in.
+ */
+export async function loadCawgPublicLists(): Promise<CawgPublicLists> {
+  if (cawgPublicLists) return cawgPublicLists
+
+  const fetchText = async (url: string, name: string) => {
+    const response = await fetch(url)
+    if (!response.ok) {
+      throw new Error(`Failed to fetch ${name}: ${response.status} ${response.statusText}`)
+    }
+    return response.text()
+  }
+
+  const [mozillaSmimeRoots, mozillaMeta, iptcAnchors, iptcEndEntities] = await Promise.all([
+    fetchText(MOZILLA_SMIME_SNAPSHOT_URL, 'bundled Mozilla S/MIME roots'),
+    fetch(MOZILLA_SMIME_SNAPSHOT_META_URL)
+      .then((r): Promise<{ fetchedAt?: string }> => (r.ok ? r.json() : Promise.resolve({})))
+      .catch((): { fetchedAt?: string } => ({})),
+    fetchText(IPTC_ANCHOR_LIST_URL, 'IPTC anchor list'),
+    fetchText(IPTC_END_ENTITY_LIST_URL, 'IPTC end-entity list'),
+  ])
+
+  cawgPublicLists = {
+    mozillaSmimeRoots,
+    mozillaSnapshotDate: mozillaMeta.fetchedAt,
+    iptcAnchors,
+    iptcEndEntities,
+  }
+  console.log('✅ Loaded CAWG interim trust lists (Mozilla S/MIME snapshot + IPTC)')
+  return cawgPublicLists
+}
+
+export function _resetCawgPublicListsCacheForTesting(): void {
+  cawgPublicLists = null
+}
+
+/** CAWG trust lists for the configured CAWG trust; public lists are skipped if they fail to load. */
+async function cawgTrustLists(): Promise<{ publicLists: TrustListSettings[]; sessionLists: TrustListSettings[] }> {
+  const publicLists: TrustListSettings[] = []
+  if (cawgTrust.publicLists) {
+    try {
+      const lists = await loadCawgPublicLists()
+      publicLists.push({ pem: lists.mozillaSmimeRoots, uri: MOZILLA_SMIME_SOURCE_URL, kind: 'cawg' })
+      if (lists.iptcAnchors.includes('BEGIN CERTIFICATE') || lists.iptcEndEntities.includes('BEGIN CERTIFICATE')) {
+        publicLists.push({
+          pem: lists.iptcAnchors,
+          uri: IPTC_ANCHOR_LIST_URL,
+          kind: 'cawg',
+          allowedList: lists.iptcEndEntities,
+        })
+      }
+    } catch (error) {
+      console.warn('CAWG interim trust lists unavailable; skipping them:', error)
+    }
+  }
+
+  const sessionLists: TrustListSettings[] = hasSessionCawgTrust(cawgTrust)
+    ? [{
+        pem: (cawgTrust.anchors ?? []).join('\n'),
+        uri: CAWG_SESSION_TRUST_URI,
+        kind: 'cawg',
+        trustedIcaIssuers: cawgTrust.trustedIcaIssuers ?? [],
+      }]
+    : []
+
+  return { publicLists, sessionLists }
+}
+
+function countTrustedCawgIdentities(crJson: CrJson): number {
+  return (crJson.manifests ?? []).reduce(
+    (n, manifest) => n + getCawgIdentities(crJson, manifest).filter((id) => id.state === 'trusted').length,
+    0,
+  )
+}
+
 // ── Trust list fetching ───────────────────────────────────────────────────────
 
-async function fetchMainTrustList(): Promise<string> {
-  if (mainTrustListPem) {
-    return mainTrustListPem
+async function fetchMainTrustLists(): Promise<MainTrustLists> {
+  if (mainTrustLists) {
+    return mainTrustLists
   }
 
   try {
@@ -304,9 +487,9 @@ async function fetchMainTrustList(): Promise<string> {
       tsaTrustListResponse.text()
     ])
 
-    mainTrustListPem = trustList + '\n' + tsaTrustList
+    mainTrustLists = { c2pa: trustList, tsa: tsaTrustList }
     console.log('✅ Loaded main trust lists')
-    return mainTrustListPem
+    return mainTrustLists
   } catch (error) {
     console.error('Failed to fetch main trust lists:', error)
     throw new Error('Failed to fetch C2PA trust lists')
@@ -316,8 +499,8 @@ async function fetchMainTrustList(): Promise<string> {
 /**
  * Fetch the ITL (Interim Trust List)
  * The ITL consists of two files with distinct roles:
- * - allowed.pem: end-entity (leaf) certificates → SDK allowedList
- * - anchors.pem: root CA certificates → SDK trustAnchors
+ * - allowed.pem: end-entity (leaf) certificates → TrustAnchor allowed_list
+ * - anchors.pem: root CA certificates → TrustAnchor trust_anchors
  */
 async function fetchITL(): Promise<ITL> {
   if (itl) {
@@ -494,6 +677,14 @@ type ReadManifestStore = (settings: Settings) => Promise<CrJson | null>
  *   1. Official C2PA trust list.
  *   2. + Session-only test certificates, if they change the outcome.
  *   3. + ITL (Interim Trust List), as a last-resort fallback.
+ *
+ * Then CAWG identities, with the chosen step's settings plus CAWG anchors:
+ *
+ *   4. + CAWG interim trust lists (Mozilla S/MIME, IPTC), if the user opted in.
+ *   5. + Session-only CAWG anchors / ICA issuers, flagged if they change a verdict.
+ *
+ * Only `cawg.identity`-scoped statuses are kept from steps 4 and 5, because c2pa-rs
+ * would also accept a CAWG anchor for the C2PA claim signer.
  */
 async function runTrustValidationFlow(
   readManifestStore: ReadManifestStore,
@@ -501,16 +692,21 @@ async function runTrustValidationFlow(
   noManifestErrorMessage: string,
 ): Promise<ExtractedCrJsonResult> {
   console.log('Fetching official C2PA trust lists and soft binding registry...')
-  const [mainTrustList, itlData, softBindingAlgs] = await Promise.all([
-    fetchMainTrustList(),
+  const [mainLists, itlData, softBindingAlgs] = await Promise.all([
+    fetchMainTrustLists(),
     fetchITL(),
     fetchSoftBindingAlgorithms(),
   ])
 
+  const officialLists: TrustListSettings[] = [
+    { pem: mainLists.c2pa, uri: TRUST_LIST_URL },
+    { pem: mainLists.tsa, uri: TSA_TRUST_LIST_URL, kind: 'tsa' },
+  ]
+
   console.log('Step 1: Validating with official trust list only...')
   const officialSettings: Settings = {
     verify: { verifyTrust: true, verifyAfterReading: true },
-    trust: { trustAnchors: mainTrustList },
+    trust: { lists: officialLists },
     softBindingAlgorithms: softBindingAlgs,
   }
 
@@ -535,13 +731,16 @@ async function runTrustValidationFlow(
   })
 
   let crJson = officialCrJson
+  let crJsonSettings = officialSettings
   let usedTestCerts = false
 
   if (testCertificates.length > 0) {
     console.log('Step 2: Validating with test certificates added...')
     const testSettings: Settings = {
       verify: { verifyTrust: true, verifyAfterReading: true },
-      trust: { trustAnchors: mainTrustList + '\n' + testCertificates.join('\n') },
+      trust: {
+        lists: [...officialLists, { pem: testCertificates.join('\n'), uri: TEST_CERTS_TRUST_URI }],
+      },
       softBindingAlgorithms: softBindingAlgs,
     }
 
@@ -562,6 +761,7 @@ async function runTrustValidationFlow(
         console.log('✅ Test certificates made the difference - signature now trusted')
         usedTestCerts = true
         crJson = testCrJson
+        crJsonSettings = testSettings
       } else {
         console.log('ℹ️  Test certificates loaded but not needed for validation')
       }
@@ -581,6 +781,7 @@ async function runTrustValidationFlow(
 
   let usedITL = false
   let finalCrJson = crJson
+  let finalSettings = crJsonSettings
 
   if (isUntrusted) {
     console.log('⚠️  Signature untrusted on main list, checking ITL...')
@@ -588,8 +789,10 @@ async function runTrustValidationFlow(
     const itlSettings: Settings = {
       verify: { verifyTrust: true, verifyAfterReading: true },
       trust: {
-        trustAnchors: mainTrustList + '\n' + itlData.anchors,
-        allowedList: itlData.allowed,
+        lists: [
+          ...officialLists,
+          { pem: itlData.anchors, uri: ITL_ANCHORS_URL, allowedList: itlData.allowed },
+        ],
       },
       softBindingAlgorithms: softBindingAlgs,
     }
@@ -621,9 +824,41 @@ async function runTrustValidationFlow(
         console.log('✅ Signature validated by ITL')
         usedITL = true
         finalCrJson = itlCrJson
+        finalSettings = itlSettings
       } else {
         console.log('❌ Signature still not trusted even with ITL')
       }
+    }
+  }
+
+  let usedCawgTrust = false
+  let usedCawgPublicLists = false
+  const { publicLists, sessionLists } = await cawgTrustLists()
+
+  const withCawgLists = (lists: TrustListSettings[]): Settings => ({
+    ...finalSettings,
+    trust: { lists: [...(finalSettings.trust?.lists ?? []), ...lists] },
+  })
+
+  if (publicLists.length > 0) {
+    console.log('Step 4: Evaluating CAWG identities against the CAWG interim trust lists...')
+    const publicCrJson = await readManifestStore(withCawgLists(publicLists))
+    if (publicCrJson) {
+      finalCrJson = withCawgIdentityStatusesFrom(finalCrJson, publicCrJson)
+      usedCawgPublicLists = true
+    }
+  }
+
+  if (sessionLists.length > 0) {
+    console.log('Step 5: Evaluating CAWG identities with session CAWG trust...')
+    const cawgCrJson = await readManifestStore(withCawgLists([...publicLists, ...sessionLists]))
+    if (cawgCrJson) {
+      const merged = withCawgIdentityStatusesFrom(finalCrJson, cawgCrJson)
+      usedCawgTrust = countTrustedCawgIdentities(merged) > countTrustedCawgIdentities(finalCrJson)
+      console.log(usedCawgTrust
+        ? '✅ Session CAWG trust made a CAWG identity trusted'
+        : 'ℹ️  Session CAWG trust loaded but did not change any CAWG identity verdict')
+      finalCrJson = merged
     }
   }
 
@@ -633,6 +868,8 @@ async function runTrustValidationFlow(
     crJson: finalCrJson,
     usedITL,
     usedTestCerts,
+    usedCawgTrust,
+    usedCawgPublicLists,
   }
 }
 
@@ -708,6 +945,8 @@ function buildConformanceReport(extracted: ExtractedCrJsonResult): ConformanceRe
     ...extracted.crJson,
     usedITL: extracted.usedITL,
     usedTestCerts: extracted.usedTestCerts,
+    usedCawgTrust: extracted.usedCawgTrust,
+    usedCawgPublicLists: extracted.usedCawgPublicLists,
     _icaOcsp: extracted.icaOcsp,
     _conformanceToolVersion: {
       commit: VERSION_INFO.sha,

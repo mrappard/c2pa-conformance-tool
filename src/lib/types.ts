@@ -33,6 +33,10 @@ export interface IcaOcspInfo {
 export interface ConformanceReport extends CrJson {
   usedITL?: boolean
   usedTestCerts?: boolean
+  /** Session-only CAWG trust anchors / ICA issuers made a CAWG identity trusted */
+  usedCawgTrust?: boolean
+  /** CAWG identities were evaluated against the opted-in CAWG interim trust lists */
+  usedCawgPublicLists?: boolean
   fetchedRemoteManifest?: boolean
   remoteManifestUrl?: string
   _icaOcsp?: Record<string, IcaOcspInfo>

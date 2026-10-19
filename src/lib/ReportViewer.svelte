@@ -199,6 +199,10 @@ import type {
   // This is determined by validating twice in processFile - once with official TL, once with test certs
   $: actuallyUsedTestCert = report.usedTestCerts === true
 
+  // Session-only CAWG anchors / ICA issuers made at least one CAWG identity trusted
+  $: usedCawgTrust = report.usedCawgTrust === true
+  $: usedCawgPublicLists = report.usedCawgPublicLists === true
+
   // Disclose when this report required fetching a remote manifest, and from where
   $: fetchedRemoteManifest = report.fetchedRemoteManifest === true
   $: remoteManifestHost = (() => {
@@ -728,6 +732,22 @@ import type {
     </div>
   {/if}
 
+  {#if usedCawgTrust}
+    <div class="mb-8 bg-amber-50 dark:bg-amber-900/30 border border-amber-300 dark:border-amber-700 rounded-2xl p-6 shadow-sm">
+      <div class="flex items-start gap-4">
+        <div class="flex-shrink-0 w-12 h-12 bg-amber-600 dark:bg-amber-700 rounded-full flex items-center justify-center text-white shadow-sm">
+          <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12 9v4" /><path d="M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0z" /><path d="M12 16h.01" /></svg>
+        </div>
+        <div class="flex-1">
+          <h3 class="font-bold text-amber-900 dark:text-amber-300 text-lg mb-2">Session CAWG Trust Used</h3>
+          <p class="text-sm text-amber-800 dark:text-amber-300 leading-relaxed">
+            At least one CAWG identity is trusted only because of CAWG trust anchors or ICA issuers added for this session. They do not affect the C2PA signer's trust.
+          </p>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if usedTestCertificates}
     <div class="mb-8 bg-amber-50 dark:bg-amber-900/30 border border-amber-300 dark:border-amber-700 rounded-2xl p-6 shadow-sm">
       <div class="flex items-start gap-4">
@@ -1056,6 +1076,9 @@ import type {
                           <span class="badge bg-purple-100 dark:bg-purple-900/40 text-purple-800 dark:text-purple-300">CAWG identity</span>
                           <span class="text-xs font-mono text-gray-500">{identity.label}</span>
                           <span class="badge {identity.state === 'trusted' ? 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-300' : identity.state === 'invalid' ? 'bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-300' : identity.state === 'untrusted' ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300' : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300'}">{CAWG_STATE_LABEL[identity.state]}</span>
+                          {#if usedCawgTrust && identity.state === 'trusted'}
+                            <span class="badge bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300" title="Trust for this identity may come from session-only CAWG trust anchors or ICA issuers you added under Test Certificates">Session CAWG trust</span>
+                          {/if}
                           {#if identity.displayName}
                             <span class="text-xs font-medium text-gray-500 dark:text-gray-400 ml-auto">
                               names <span class="font-semibold text-gray-700 dark:text-gray-300">{identity.displayName}</span>
@@ -1065,6 +1088,9 @@ import type {
                         <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">
                           {sigTypeDisplayName(identity.sigType)}{#if identity.issuer}{' issued by '}<span class="font-mono">{identity.issuer}</span>{:else if identity.certificate?.issuer?.CN}{` issued by ${identity.certificate.issuer.CN}`}{/if}.
                           These results apply to this identity assertion's own credential, not the manifest's signature.
+                          {#if usedCawgPublicLists}
+                            Evaluated against the CAWG interim trust lists (Mozilla S/MIME roots and IPTC).
+                          {/if}
                         </p>
                         {#if identity.failure.length + identity.success.length + identity.informational.length === 0}
                           <p class="text-sm text-gray-500 dark:text-gray-400">No validation statuses were reported for this identity assertion.</p>
